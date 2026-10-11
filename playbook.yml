@@ -1,0 +1,78 @@
+---
+- name: Развертывание HA-кластера RabbitMQ
+  hosts: rmq_cluster
+  become: true
+  vars:
+    erlang_cookie: "SUPER_SECRET_ERLANG_COOKIE_59"
+
+  tasks:
+    - name: 1. Настройка локального сопоставления имен в /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ item }}"
+        state: present
+      loop:
+        - "127.0.0.1 {{ ansible_hostname }}"
+        - "192.168.56.11 hw-net1"
+        - "192.168.56.12 hw-net2"
+
+    - name: 2. Обновление кэша пакетов apt
+      apt:
+        update_cache: yes
+
+    - name: 3. Установка RabbitMQ и Erlang
+      apt:
+        name:
+          - erlang-base
+          - rabbitmq-server
+        state: present
+
+    - name: 4. Остановка службы перед синхронизацией Erlang cookie
+      systemd:
+        name: rabbitmq-server
+        state: stopped
+
+    - name: 5. Запись идентичного Erlang cookie на все ноды
+      copy:
+        content: "{{ erlang_cookie }}"
+        dest: /var/lib/rabbitmq/.erlang.cookie
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0400'
+
+    - name: 6. Запуск службы RabbitMQ с новым Erlang cookie
+      systemd:
+        name: rabbitmq-server
+        state: started
+
+    - name: 7. Включение плагина веб-интерфейса (Management Plugin)
+      command: rabbitmq-plugins enable rabbitmq_management
+      register: plugin_enable
+      changed_when: "'Enabling plugins' in plugin_enable.stdout"
+      notify: Restart RabbitMQ
+
+    - name: 8. Остановка приложения RabbitMQ внутри брокера на ВТОРОЙ ноде
+      command: rabbitmqctl stop_app
+      when: ansible_hostname == "hw-net2"
+
+    - name: 9. Включение второй ноды в кластер к первой (hw-net1)
+      command: rabbitmqctl join_cluster rabbit@hw-net1
+      when: ansible_hostname == "hw-net2"
+      register: cluster_join
+      failed_when: 
+        - cluster_join.rc != 0 
+        - "'already_member_of_this_cluster' not in cluster_join.stderr"
+
+    - name: 10. Запуск приложения RabbitMQ на второй ноде после объединения
+      command: rabbitmqctl start_app
+      when: ansible_hostname == "hw-net2"
+
+    - name: 11. Создание HA-all политики зеркалирования очередей на мастере (hw-net1)
+      command: rabbitmqctl set_policy ha-all ".*" '{"ha-mode":"all","ha-sync-mode":"automatic"}'
+      when: ansible_hostname == "hw-net1"
+
+  handlers:
+    - name: Restart RabbitMQ
+      systemd:
+        name: rabbitmq-server
+        state: restarted
